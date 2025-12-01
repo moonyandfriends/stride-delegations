@@ -1,10 +1,36 @@
 # Stride Delegations - Google Apps Script
 
-This Google Apps Script automates the calculation and management of Stride's standardized delegation methodology across all host chains.
+## Governance Proposal: Standardize Stride's Delegation Methodology
+
+This repository contains the implementation of a Stride governance proposal to **standardize Stride's delegation methodology across all host chains** where Stride provides liquid staking services.
+
+### Background
+
+Stride provides liquid staking services for multiple Cosmos chains, managing delegations of liquid staked tokens to validators on each host chain. Historically, delegation strategies have differed by chain—some using copy-staking models, others relying on council-selected validators or other criteria. These variations have led to:
+
+- **Increased operational complexity** managing different approaches per chain
+- **Higher costs** particularly in relaying fees as validator sets expand
+- **Inconsistent delegation philosophies** across the Stride ecosystem
+
+This proposal implements a **uniform delegation strategy for all host chains**, addressing these challenges while optimizing for cost efficiency and operational simplicity.
+
+### Goals
+
+1. **Standardization**: Single, objective delegation methodology across all Stride-supported chains
+2. **Cost reduction**: Minimize relaying costs by capping the number of delegations per chain
+3. **Decentralization**: Distribute stake across qualifying validators using proportional allocation
+4. **Automation**: Where possible, use on-chain data to eliminate manual intervention
+5. **Scalability**: Dynamic criteria that adapt to different validator set sizes
 
 ## Overview
 
-This script implements Stride's unified delegation strategy, which distributes delegations according to each validator's stake weight among qualifying validators using a capped proportional ("water-filling") method. No validator receives more than 9% of Stride's stake on any chain (unless insufficient eligible validators exist).
+This Google Apps Script automates the calculation and management of Stride's standardized delegation methodology. It:
+
+- Fetches live validator data from multiple chains via APIs
+- Applies objective eligibility criteria automatically
+- Distributes delegations proportionally using a capped "water-filling" algorithm
+- Limits delegations to 32 validators per chain to optimize relaying costs
+- Ensures no validator receives more than 9% of Stride's stake (dynamic cap)
 
 ## Live Spreadsheet
 
@@ -13,59 +39,163 @@ https://docs.google.com/spreadsheets/d/1-CIvqQXiip-IMAf_DF3hTaVyjfWXbIBsbmCdplIv
 
 ## Delegation Methodology
 
+Delegations are distributed according to each validator's stake weight among the set of qualifying validators, using a **capped proportional ("water-filling") method** to ensure no validator receives more than 9% of Stride's stake on that chain.
+
 ### Universal Eligibility Criteria (All Host Chains)
 
-1. **Exclude known CEX validators**
-2. **Commission rate ≤ 10%**
-3. **Not in the bottom 5% of the active set by stake**¹
-4. **Top validator exclusions based on active set size:**
-   - 64+ validators → exclude top 8 by stake¹
-   - 98+ validators → exclude top 12 by stake¹
-   - 132+ validators → exclude top 16 by stake¹
-5. **Limit to top 32 validators** among those meeting above criteria, ranked by stake weight¹
+These criteria are applied to **all host chains** and use only on-chain data for full automation:
 
-¹ *All stake measurements exclude Stride's current delegations to prevent circular reinforcement*
+1. **Active status**: Validator must be in bonded status (`BOND_STATUS_BONDED`)
+2. **No CEX validators**: Exclude known centralized exchange validators (detected by moniker matching)
+3. **Commission ≤ 10%**: Commission rate must be 10% or lower
+4. **Not in bottom 5%**: Exclude validators in the bottom 5% of the active set by stake¹
+5. **Dynamic top-exclusions**: Exclude top validators based on active set size to promote downward redistribution:
+   - **64+ validators** → exclude top 8 by stake¹
+   - **98+ validators** → exclude top 12 by stake¹
+   - **132+ validators** → exclude top 16 by stake¹
+6. **32-validator cap per chain**: Among validators meeting above criteria, limit to the top 32 by stake weight¹
 
-### Additional Criteria (Cosmos Hub, Osmosis, Celestia, dYdX Only)
+¹ **Critical**: All stake measurements exclude Stride's current delegations to prevent circular reinforcement of existing positions. This is calculated as: `Live Delegations - Stride Delegations`
 
-These flagship chains with significant TVL have stricter requirements:
+### Additional Criteria (Flagship Chains Only)
 
-6. **Governance participation:** Must have voted on at least 5 of the 10 most recent proposals (or 2 of 5 if fewer than 10 total proposals exist)
-7. **Uptime:** Average signing time ≥ 95% over the past 30 days
+The following chains have **additional requirements** due to their significant TVL in Stride and the availability of reliable off-chain data:
 
-*Note: These additional criteria require off-chain data from indexers and cannot be fully automated, hence their limitation to flagship chains.*
+- **Cosmos Hub** (cosmoshub-4)
+- **Osmosis** (osmosis-1)
+- **Celestia** (celestia)
+- **dYdX** (dydx-mainnet-1)
 
-## Distribution Method
+**Additional requirements for flagship chains:**
 
-Among all qualifying validators, delegations are distributed proportionally to each validator's stake weight using a **capped proportional (water-filling) approach**:
+7. **Governance participation**:
+   - **Cosmos Hub, Osmosis, dYdX**: Must have voted on at least **5 of the 10** most recent governance proposals
+   - **Celestia**: Must have voted on at least **2 of the 5** most recent governance proposals
+   - If governance has not had 10 proposals, the threshold adjusts (e.g., 2 of 5 most recent)
 
-- Validators receive delegations proportional to their stake
-- No single validator receives more than 9% of Stride's total stake on that chain
-- This prevents over-concentration while maintaining proportionality
+8. **Uptime / Sign time ≥ 95%**: Average signing time must be at least 95% over the past 30 days
+
+**Why only flagship chains?**
+These criteria require off-chain data that cannot be queried directly from nodes:
+- Proposals are pruned from state after the voting period ends
+- There is no native uptime query available on-chain
+
+A reliable indexer is needed to track this data, and manual intervention may be required. Due to these constraints, stricter requirements are only applied to flagship chains with significant TVL in Stride.
+
+## Distribution Method: Capped Proportional ("Water-Filling") Algorithm
+
+Among all qualifying validators, delegations are distributed according to each validator's stake weight using a **capped proportional allocation** approach:
+
+### How It Works
+
+1. **Proportional baseline**: Start by distributing weight proportional to each eligible validator's stake (excluding Stride's current delegations)
+2. **Apply cap**: If any validator would receive more than 9% of total Stride stake, cap them at 9%
+3. **Redistribute overflow**: Take the excess weight from capped validators and redistribute it proportionally among uncapped validators
+4. **Repeat**: Continue the process until all validators are either capped or there's no remaining weight to distribute
+5. **Small validator sets**: If there are fewer than 12 eligible validators with positive stake, the cap is not applied (simple proportional distribution)
+
+### Dynamic Cap Formula
+
+The per-validator cap varies based on the number of eligible validators to ensure feasible allocation:
+
+```
+softCap(N) = 8% × (32 / N)^0.5
+finalCap(N) = max(softCap(N), 1/N)
+```
+
+Where `N` is the number of eligible validators. This ensures:
+- **Larger sets**: More redistribution (cap approaches 8%)
+- **Smaller sets**: Higher caps to allow full allocation
+- **Mathematical feasibility**: Cap never goes below 1/N, ensuring 100% allocation is always possible
+
+This "water-filling" metaphor describes how delegation weight "fills up" validators until they hit their cap, then "overflows" to the next validator.
+
+### Benefits
+
+- **Prevents over-concentration**: No single validator gets too much Stride stake
+- **Maintains proportionality**: Larger validators still receive more, just not excessively
+- **Decentralizes stake**: Encourages distribution across multiple validators
+- **Scales dynamically**: Adapts to different validator set sizes
+
+### Implementation
+
+The algorithm is implemented in `computeCappedWeights()` and `computeDynamicCapFraction()` functions (lines 136-213 in stride-delegations.gs).
 
 ## Rebalancing Schedule
 
 - **Quarterly rebalancing** to reflect changes in validator stake weights and eligibility
-- Initial rebalancing aligned with Q1 2025
-- Validators meeting criteria receive proportional delegations
-- Ineligible validators have delegations reduced or removed
+- **Initial rebalancing**: Q1 2025 (proposal is currently in Q4 2024)
+- **Process**: At each rebalance, validator eligibility is re-evaluated and new weights are computed
+- **Changes**: Validators meeting criteria receive proportional delegations; ineligible validators have delegations reduced or removed
 
-## Special Cases
+## Special Cases & Limitations
 
-**Dymension and Celestia (Multisig-handled):**
-- Redelegations on these chains are currently managed via multisig
-- Not included in automated rebalancing until moved to ICA/ICQ handling
-- Stride's ICA/ICQ-handled Celestia liquid staking is fully covered
+### Dymension and Celestia (Multisig-Handled)
 
-## How It Works
+This standardized methodology covers **delegations and quarterly rebalancing** only. It does NOT currently cover:
+
+- **Redelegations** on Dymension (e.g., for slashing avoidance)
+- **Redelegations** on the current multisig-handled Celestia liquid staking
+
+These are currently managed via multisig and will be moved to this automated program once both chains are fully handled by ICA/ICQ.
+
+**Note**: Stride's **ICA/ICQ-handled Celestia** liquid staking is fully covered by this proposal.
+
+### Intent for Full Coverage
+
+The long-term intention is to move all chains entirely to this standardized program after redelegation mechanisms are migrated from multisig to ICA control.
+
+## Governance Voting Options
+
+This proposal requires Stride governance approval. Voting options:
+
+- **YES** – You agree that Stride should standardize its delegation methodology across all host chains as outlined in this proposal.
+
+- **NO** – You disagree that Stride should standardize its delegation methodology across all host chains as outlined in this proposal.
+
+- **NO WITH VETO** – A NoWithVeto vote indicates that the proposal either:
+  1. Is deemed to be spam or irrelevant to Stride
+  2. Disproportionately infringes on minority interests
+  3. Violates or encourages violation of the rules of engagement as currently set out by Stride governance
+
+  If NoWithVeto votes exceed one-third of total votes, the proposal is rejected and the deposit is burned.
+
+- **ABSTAIN** – You wish to contribute to quorum but formally decline to vote either for or against the proposal.
+
+## Rationale & Final Thoughts
+
+This standardization advances Stride's objectives of efficient and cost-effective liquid staking. By unifying the delegation process, Stride can:
+
+- **Minimize operational overhead**: Single methodology eliminates chain-specific logic and maintenance
+- **Reduce relaying costs**: 32-validator cap per chain controls transaction fees
+- **Improve transparency**: Objective, automated criteria eliminate subjective decisions
+- **Enhance scalability**: Dynamic criteria adapt automatically as validator sets grow or shrink
+
+Stride governance retains authority to refine criteria or schedules through future proposals when necessary. Transparency is maintained through the public spreadsheet and this open-source implementation.
+
+---
+
+## Implementation Details
+
+This Google Apps Script implementation provides a transparent, auditable calculation of Stride's delegations. The code is open-source and runs directly within a Google Spreadsheet.
 
 ### Data Sources
 
 The script combines data from multiple sources:
 
-1. **Stride delegations:** Fetched from Polkachu API (`https://stride-api.polkachu.com/Stride-Labs/stride/stakeibc/host_zone`)
-2. **Live validator data:** Fetched from cosmos.directory REST endpoints for each chain
-3. **Uptime and governance data (flagship chains only):** Manually entered from https://analytics.smartstake.io
+1. **Stride delegations**: Fetched from Polkachu API
+   - Endpoint: `https://stride-api.polkachu.com/Stride-Labs/stride/stakeibc/host_zone`
+   - Provides current Stride delegations to each validator on each chain
+
+2. **Live validator data**: Fetched from cosmos.directory REST endpoints
+   - Endpoint format: `https://rest.cosmos.directory/{network}/cosmos/staking/v1beta1/validators`
+   - Provides validator status, commission, total stake, and metadata
+   - Pagination limit: 1000 validators per chain
+
+3. **Uptime and governance data (flagship chains only)**: Manually entered from SmartStake analytics
+   - Source: https://analytics.smartstake.io
+   - Required for Cosmos Hub, Osmosis, Celestia, and dYdX
+   - Cannot be automated due to lack of on-chain queries for historical proposal votes and uptime metrics
 
 ### Two-Step Process
 
@@ -207,19 +337,41 @@ Common ineligibility reasons:
 - `uptime<95%`: Below 95% uptime threshold (flagship only)
 - `gov<5/10` or `gov<2/5`: Insufficient governance participation (flagship only)
 
-## Governance
+## Governance & Authority
 
-This implementation follows Stride Governance Proposal [NUMBER]. Any modifications to delegation criteria or methodology require governance approval.
+This implementation is the reference code for a Stride governance proposal to standardize delegations across all host chains. The proposal specifies:
+
+- Eligibility criteria for all chains
+- The capped proportional allocation algorithm
+- The quarterly rebalancing schedule
+- Special handling for flagship chains
+
+**Any modifications to the delegation methodology require Stride governance approval through a new proposal.**
+
+The spreadsheet linked above serves as:
+1. **Transparency tool**: Public visibility into current and proposed delegations
+2. **Calculation engine**: Automated computation of eligibility and weights
+3. **Audit trail**: Historical record of delegation decisions
 
 ## Repository Structure
 
+This repository contains the complete implementation:
+
 ```
 stride-delegations/
-├── README.md                 # This file - user documentation
-├── CLAUDE.md                 # Claude Code assistant guide
-├── stride-delegations.gs     # Main Google Apps Script code
-└── .gitignore               # Git ignore file
+├── README.md                 # This file - comprehensive governance context and user documentation
+├── CLAUDE.md                 # Technical guide for Claude Code assistant (architecture, code organization)
+├── stride-delegations.gs     # Main Google Apps Script implementation (1,284 lines)
+└── .gitignore               # Standard Git ignores
 ```
+
+**Deployment**: Code must be manually copied to/from the Google Apps Script editor in the spreadsheet. There is no automated sync between this GitHub repository and the live spreadsheet.
+
+**Development workflow**:
+1. Make changes in Google Apps Script editor (Extensions > Apps Script)
+2. Test thoroughly using the script's menu functions
+3. Copy updated code back to this repository
+4. Commit and push to GitHub for version control and transparency
 
 ## Technical Details
 
@@ -259,6 +411,40 @@ See `CHAIN_ID_TO_NETWORK` constant (lines 28-51).
 
 ## Contributing
 
-Changes to the delegation methodology must be approved through Stride governance. Technical improvements and bug fixes can be submitted via pull request.
+### Governance Changes
 
-For questions or issues, please contact Stride Labs or open an issue in this repository.
+Changes to the **delegation methodology** (eligibility criteria, weight caps, rebalancing frequency, etc.) must be approved through Stride governance via a new proposal. This ensures community consensus on how Stride's liquid staking delegations are managed.
+
+### Technical Improvements
+
+Technical improvements and bug fixes that don't change the methodology can be submitted via pull request:
+
+- Performance optimizations
+- Code refactoring for maintainability
+- Bug fixes in data fetching or calculations
+- Improved error handling
+- Documentation updates
+
+**Important**: Ensure all changes are tested in the Google Apps Script editor before submitting a PR. Include before/after screenshots or validation data demonstrating correct behavior.
+
+### Support & Questions
+
+- **Issues**: Open an issue in this repository for bugs or feature requests
+- **Stride Community**: Discuss governance-related questions in Stride's official channels
+- **Contact**: Reach out to Stride Labs for urgent matters
+
+## License & Disclaimer
+
+This code is provided as-is for transparency and community review. Use at your own risk. The delegation methodology is subject to Stride governance decisions.
+
+## Additional Resources
+
+- **Live Spreadsheet**: [View current delegations](https://docs.google.com/spreadsheets/d/1-CIvqQXiip-IMAf_DF3hTaVyjfWXbIBsbmCdplIvDYE/edit?usp=sharing)
+- **Stride Protocol**: [Website](https://stride.zone) | [Docs](https://docs.stride.zone)
+- **cosmos.directory**: [Validator data source](https://cosmos.directory)
+- **SmartStake Analytics**: [Uptime & governance data](https://analytics.smartstake.io)
+- **Polkachu**: [Stride API provider](https://polkachu.com)
+
+---
+
+**This implementation demonstrates Stride's commitment to transparent, objective, and automated delegation management across the Cosmos ecosystem.**
