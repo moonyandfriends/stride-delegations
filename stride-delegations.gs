@@ -35,14 +35,14 @@ const CHAIN_ID_TO_NETWORK = {
   'haqq_11235-1': 'haqq',
   'juno-1': 'juno',
 
-  // Bandchain – keep only laozi-mainnet
+  // Bandchain  keep only laozi-mainnet
   'laozi-mainnet': 'bandchain',
 
   'osmosis-1': 'osmosis',
   'phoenix-1': 'terra2',
   'sommelier-3': 'sommelier',
 
-  // Saga – support both possible chain IDs
+  // Saga  support both possible chain IDs
   'saga-1': 'saga',
   'ssc-1': 'saga',
 
@@ -59,19 +59,14 @@ const COL_DELTA           = 5;  // E: Delegations Minus Stride
 const COL_COMMISSION      = 6;  // F: Commission
 const COL_CEX             = 7;  // G: CEX
 const COL_ACTIVE          = 8;  // H: Active
-const COL_UPTIME          = 9;  // I: Uptime (manual / VLOOKUP)
-const COL_GOV             = 10; // J: Governance (manual / VLOOKUP)
+const COL_UPTIME          = 9;  // I: Uptime
+const COL_GOV             = 10; // J: Governance
 const COL_ELIG            = 11; // K: Eligibility
 const COL_REASON          = 12; // L: Reason
 const COL_CURRENT_WEIGHT  = 13; // M: Current Weight
 const COL_NEW_WEIGHT      = 14; // N: New Weight
 
 const LAST_COLUMN = COL_NEW_WEIGHT;
-
-// Max share per validator for New Weight
-const NEW_WEIGHT_CAP = 0.09;   // 9%
-// Minimum positive-stake eligible validators before we enforce the cap
-const MIN_COUNT_FOR_CAP = 12;
 
 // -----------------------------------------------------------------------------
 // Menu
@@ -126,6 +121,98 @@ function fetchStrideHostZones() {
 }
 
 // -----------------------------------------------------------------------------
+// Capped weights helpers (Variant B dynamic cap)
+// -----------------------------------------------------------------------------
+
+/**
+ * Capped proportional allocation ("water-filling").
+ *
+ * stakes:     array of non-negative numbers (e.g. Delegations Minus Stride for eligible validators)
+ * capFraction: maximum allowed weight per validator (e.g. 0.08 for 8%)
+ *
+ * Returns an array of weights of the same length, summing to 1 (or 0 if all stakes are 0),
+ * with each weight <= capFraction.
+ */
+function computeCappedWeights(stakes, capFraction) {
+  const n = stakes.length;
+  const weights = new Array(n).fill(0);
+  if (!n) return weights;
+
+  let remainingMass = 1; // total weight we want to distribute
+  let remainingTotal = stakes.reduce((sum, x) => sum + x, 0);
+  const active = new Array(n).fill(true);
+
+  if (remainingTotal <= 0) {
+    return weights; // all zero stakes -> all weights 0
+  }
+
+  while (true) {
+    let anyCapped = false;
+
+    const baseFactor = remainingMass / remainingTotal;
+
+    // First pass: see who would exceed the cap and cap them
+    for (let i = 0; i < n; i++) {
+      if (!active[i]) continue;
+
+      const wCandidate = stakes[i] * baseFactor; // unconstrained proportional weight
+
+      if (wCandidate > capFraction + 1e-12) {
+        weights[i] = capFraction;
+        active[i] = false;
+        remainingMass -= capFraction;
+        remainingTotal -= stakes[i];
+        anyCapped = true;
+      }
+    }
+
+    // If nobody exceeded the cap this round, just assign remaining proportionally and finish
+    if (!anyCapped || remainingMass <= 1e-9 || remainingTotal <= 0) {
+      if (remainingMass > 0 && remainingTotal > 0) {
+        const finalFactor = remainingMass / remainingTotal;
+        for (let i = 0; i < n; i++) {
+          if (!active[i]) continue;
+          weights[i] = stakes[i] * finalFactor;
+        }
+      }
+      break;
+    }
+  }
+
+  return weights;
+}
+
+/**
+ * Dynamic per-validator cap as a fraction (01) based on the
+ * number of eligible validators, using Variant B with a
+ * feasibility constraint:
+ *
+ *   softCap(N) = 8% * (32 / N)^0.5
+ *   cap(N)     = max( softCap(N), 1 / N )
+ *
+ * This guarantees there is always a valid allocation that
+ * sums to 100% while respecting the cap.
+ */
+function computeDynamicCapFraction(nEligible) {
+  if (nEligible <= 0) return 0;
+
+  const baseCap = 0.08;   // 8% when N = 32
+  const alpha = 0.5;      // sqrt scaling
+  const Nref = 32;
+
+  // Variant B "soft" cap
+  let capSoft = baseCap * Math.pow(Nref / nEligible, alpha);
+
+  // Minimum cap needed to be able to allocate 100% of stake
+  const capMin = 1 / nEligible;
+
+  // Final cap: cannot be below 1/N (otherwise full allocation is impossible)
+  const cap = Math.max(capSoft, capMin);
+
+  return cap;
+}
+
+// -----------------------------------------------------------------------------
 // Build sheets for each host zone
 // -----------------------------------------------------------------------------
 
@@ -138,22 +225,17 @@ function fetchStrideHostZones() {
  *  - Commission rate <= 10%
  *  - Not in the bottom 5% of the active set by stake (excluding Stride)
  *  - If active set has:
- *       64+ validators → exclude top 8 by stake (excl. Stride)
- *       98+ validators → exclude top 12
- *       132+ validators → exclude top 16
+ *       64+ validators  exclude top 8 by stake (excl. Stride)
+ *       98+ validators  exclude top 12
+ *       132+ validators  exclude top 16
  *
- *  Then apply a 32-validator cap per chain:
+ * Then apply a 32-validator cap per chain:
  *  - Among validators that pass universal criteria, sort by Delegations Minus Stride
  *    (stake excluding Stride) descending, and only the top 32 remain finally eligible.
+ *  - Others get reason "over_32_cap".
  *
  * For flagship chains, we only compute universal + reasons here; final eligibility
  * (gov + uptime + 32-cap) and New Weight are applied later via the menu.
- *
- * New Weight:
- *  - For non-flagship chains: capped proportional ("water-filling") with 9% cap
- *    over finalEligible validators, provided there are at least MIN_COUNT_FOR_CAP
- *    positive-stake eligible validators; otherwise simple proportional.
- *  - For flagship chains: computed later in applyFlagshipEligibilityForActiveSheet.
  */
 function createStrideSheetsWithLiveData(ss, hostZones) {
   hostZones.forEach((hz) => {
@@ -296,7 +378,7 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
             }
           });
         } else {
-          // ≤ 32: finalEligible = universalEligible
+          //  32: finalEligible = universalEligible
           rows.forEach((r) => {
             r.finalEligible = r.universalEligible;
           });
@@ -407,7 +489,7 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
       sheet.getRange(2, COL_ELIG, numRows, 1).setValues(eligibilityValues);
       sheet.getRange(2, COL_REASON, numRows, 1).setValues(reasonValues);
 
-      // --- Current Weight + New Weight (non-flagship) ---
+      // --- Current Weight + New Weight (with dynamic cap on non-flagship chains) ---
 
       // Current Weight: share of Stride's delegations on that chain.
       const totalStrideDelegations = rows.reduce(
@@ -423,36 +505,34 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
       });
 
       // New Weight:
-      // - Non-flagship: capped proportional (water-filling) over finalEligible rows.
-      // - Flagship: left blank here; computed later in applyFlagshipEligibilityForActiveSheet.
-      let newWeightValues;
+      // - For non-flagship chains, apply capped proportional allocation with a dynamic cap:
+      //     Variant B: cap(N) = max( 8% * (32/N)^0.5, 1/N )
+      // - For flagship chains, New Weight is left blank here and computed later
+      //   in applyFlagshipEligibilityForActiveSheet.
+      const perRowNewWeights = new Array(rows.length).fill(null);
 
       if (!isFlagship) {
-        const eligibleRows = rows.filter(
-          (r) => r.finalEligible && r.deltaNoStride > 0
-        );
-        const stakes = eligibleRows.map((r) => r.deltaNoStride);
-        const weights = computeCappedProportionalWeights(
-          stakes,
-          NEW_WEIGHT_CAP,
-          MIN_COUNT_FOR_CAP
-        );
+        const eligibleIndices = [];
+        const eligibleStakes = [];
 
-        const weightByAddr = {};
-        eligibleRows.forEach((r, idx) => {
-          weightByAddr[r.address] = weights[idx];
-        });
-
-        newWeightValues = rows.map((r) => {
-          if (r.finalEligible && weightByAddr.hasOwnProperty(r.address)) {
-            return [weightByAddr[r.address]];
+        rows.forEach((r, idx) => {
+          if (r.finalEligible && r.deltaNoStride > 0) {
+            eligibleIndices.push(idx);
+            eligibleStakes.push(r.deltaNoStride);
           }
-          return [null];
         });
-      } else {
-        // Flagship chains: New Weight set in applyFlagshipEligibilityForActiveSheet.
-        newWeightValues = rows.map(() => [null]);
+
+        if (eligibleIndices.length > 0) {
+          const capFraction = computeDynamicCapFraction(eligibleIndices.length);
+          const weights = computeCappedWeights(eligibleStakes, capFraction);
+
+          for (let k = 0; k < eligibleIndices.length; k++) {
+            perRowNewWeights[eligibleIndices[k]] = weights[k];
+          }
+        }
       }
+
+      const newWeightValues = perRowNewWeights.map((w) => [w]);
 
       sheet
         .getRange(2, COL_CURRENT_WEIGHT, numRows, 1)
@@ -512,7 +592,7 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
 }
 
 // -----------------------------------------------------------------------------
-// Flagship eligibility (gov + uptime + 32-cap + capped weights)
+// Flagship eligibility (gov + uptime + 32-cap + weights)
 // -----------------------------------------------------------------------------
 
 /**
@@ -523,13 +603,13 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
  *   - Universal criteria (recomputed from sheet)
  *   - Uptime (>= 95%)
  *   - Governance:
- *       Cosmos/Osmosis/dYdX: ≥ 5/10 of recent proposals (fraction ≥ 0.5)
- *       Celestia:            ≥ 2/5 of recent proposals (fraction ≥ 0.4)
+ *       Cosmos/Osmosis/dYdX:  5/10 of recent proposals
+ *       Celestia:             2/5 of recent proposals
  *   - 32-validator cap among those that pass the above.
  *
  * Also recomputes:
  *   - Current Weight (based on Stride delegations)
- *   - New Weight (capped proportional with 9% cap when enough validators)
+ *   - New Weight (based on eligible stake excluding Stride, with dynamic cap)
  *
  * Writes final Y/N to Eligibility and detailed reasons to Reason.
  */
@@ -601,41 +681,57 @@ function applyFlagshipEligibilityForActiveSheet() {
     if (typeof val === 'number') {
       const n = val;
       if (isNaN(n)) return 0;
-      if (n <= 1.5) return n;   // already 0–1
-      return n / 100.0;         // 95 -> 0.95
+      if (n >= 0 && n <= 1.5) return n;  // already fraction (01)
+      return n / 100.0;                  // 95 -> 0.95
     }
     const s = String(val).replace('%', '').trim();
     const n = parseFloat(s);
     if (isNaN(n)) return 0;
+    if (n >= 0 && n <= 1.5) return n;
+    return n / 100.0;
+  }
+
+  function parseCommission(val) {
+    if (val === '' || val == null) return null;
+    if (typeof val === 'number') {
+      const n = val;
+      if (isNaN(n)) return null;
+      if (n <= 1.5) return n;   // decimal 01
+      return n / 100.0;         // 5 -> 0.05
+    }
+    const s = String(val).replace('%', '').trim();
+    const n = parseFloat(s);
+    if (isNaN(n)) return null;
     if (n <= 1.5) return n;
     return n / 100.0;
   }
 
-  // Governance parser: cope with "9/10", "3/5", "=9/10", 0.9, 9, "#N/A", and
-  // also ignore large numeric date-serials like 45910 by treating them as 0.
+  // Governance parser: cope with "9/10", "3/5", "=9/10", 0.9, 9, "#N/A", or large date-like ints
   function parseGovFraction(val, isCelestia) {
     const defaultDenom = isCelestia ? 5 : 10;
 
     if (val === '' || val == null) return 0;
 
+    // Handle numeric cases: decimals, small integers, or bad large numbers
     if (typeof val === 'number') {
       const n = val;
       if (isNaN(n)) return 0;
 
-      // Already a fraction (e.g. 0.8)
+      // If it's clearly a fraction decimal (01.5), use as-is
       if (n >= 0 && n <= 1.5) {
         return n;
       }
 
-      // Small integer vote count (1..denom)
+      // If it's a small integer vote count (1..defaultDenom), treat as count/denom
       if (n > 0 && n <= defaultDenom) {
         return n / defaultDenom;
       }
 
-      // Large numbers (e.g. date serials 45910) -> treat as "no data"
+      // Large numbers (e.g. 45910 from dates)  treat as unknown / 0
       return 0;
     }
 
+    // From here on, treat it as text
     const s = String(val).trim();
     if (!/\d/.test(s)) return 0;
 
@@ -681,20 +777,7 @@ function applyFlagshipEligibilityForActiveSheet() {
       strideDelegationNum = isNaN(n) ? 0 : n;
     }
 
-    const commissionRate = (function (val) {
-      if (val === '' || val == null) return null;
-      if (typeof val === 'number') {
-        const n = val;
-        if (isNaN(n)) return null;
-        if (n <= 1.5) return n;
-        return n / 100.0;
-      }
-      const s = String(val).replace('%', '').trim();
-      const n = parseFloat(s);
-      if (isNaN(n)) return null;
-      if (n <= 1.5) return n;
-      return n / 100.0;
-    })(commValues[i][0]);
+    const commissionRate = parseCommission(commValues[i][0]);
 
     const cexFlag = String(cexValues[i][0] || '').trim().toUpperCase();
     const isCex = cexFlag === 'Y';
@@ -842,7 +925,7 @@ function applyFlagshipEligibilityForActiveSheet() {
     }
   }
 
-  // --- Weights: Current Weight + New Weight (capped) ---
+  // --- Weights: Current Weight + New Weight (with dynamic cap) ---
 
   const totalStrideDelegations = rows.reduce(
     (sum, r) => sum + (r.strideDelegationNum || 0),
@@ -851,7 +934,6 @@ function applyFlagshipEligibilityForActiveSheet() {
 
   const currentWeightValues = [];
 
-  // Current Weight: simple share of Stride delegations
   for (const r of rows) {
     let cw = null;
     if (totalStrideDelegations > 0) {
@@ -860,26 +942,32 @@ function applyFlagshipEligibilityForActiveSheet() {
     currentWeightValues.push([cw]);
   }
 
-  // New Weight: capped proportional ("water-filling") over finalEligible rows
-  const eligibleRows = rows.filter((r) => r.finalEligible && (r.tokens || 0) > 0);
-  const stakes = eligibleRows.map((r) => r.tokens || 0);
-  const weights = computeCappedProportionalWeights(
-    stakes,
-    NEW_WEIGHT_CAP,
-    MIN_COUNT_FOR_CAP
-  );
+  // New Weight for flagship chains:
+  // Use capped proportional allocation over finalEligible validators
+  // with dynamic cap computed via Variant B.
 
-  const weightByAddr = {};
-  eligibleRows.forEach((r, idx) => {
-    weightByAddr[r.addr] = weights[idx];
-  });
+  const eligibleIndices = [];
+  const eligibleStakes = [];
 
-  const newWeightValues = rows.map((r) => {
-    if (r.finalEligible && weightByAddr.hasOwnProperty(r.addr)) {
-      return [weightByAddr[r.addr]];
+  rows.forEach((r, idx) => {
+    if (r.finalEligible && (r.tokens || 0) > 0) {
+      eligibleIndices.push(idx);
+      eligibleStakes.push(r.tokens || 0); // tokens = Delegations Minus Stride
     }
-    return [null];
   });
+
+  const perRowNewWeights = new Array(rows.length).fill(null);
+
+  if (eligibleIndices.length > 0) {
+    const capFraction = computeDynamicCapFraction(eligibleIndices.length);
+    const weights = computeCappedWeights(eligibleStakes, capFraction);
+
+    for (let k = 0; k < eligibleIndices.length; k++) {
+      perRowNewWeights[eligibleIndices[k]] = weights[k];
+    }
+  }
+
+  const newWeightValues = perRowNewWeights.map((w) => [w]);
 
   // --- Write back Eligibility + Reason + Weights ---
 
@@ -920,7 +1008,7 @@ function applyFlagshipEligibilityForActiveSheet() {
       sheetName +
       '". Eligible validators (after 32-cap): ' +
       eligibleCount +
-      ' (Eligibility, Reason, and capped New Weight updated).'
+      ' (Eligibility, Reason, and Weight columns updated).'
   );
 }
 
@@ -936,7 +1024,7 @@ function fetchLiveValidatorsForHostZone(hz) {
     Logger.log(
       'No cosmos.directory mapping for chain_id ' +
         chainId +
-        ' — live data skipped.'
+        '  live data skipped.'
     );
     return [];
   }
@@ -1126,131 +1214,6 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
 }
 
 // -----------------------------------------------------------------------------
-// Capped proportional weight helper (water-filling)
-// -----------------------------------------------------------------------------
-
-/**
- * Compute capped proportional weights using a "water-filling" algorithm.
- *
- * stakes: array of non-negative numbers (e.g., stake minus Stride)
- * cap: maximum allowed weight per entry (e.g., 0.09 for 9%)
- * minCountForCap: if number of positive-stake entries is less than this,
- *                 no cap is applied (simple proportional weights).
- *
- * Returns an array of weights of same length as stakes, summing to ~1
- * (or 0 if total stake is 0), each in [0, cap] when cap is active.
- */
-function computeCappedProportionalWeights(stakes, cap, minCountForCap) {
-  const n = stakes.length;
-  const weights = new Array(n).fill(0);
-
-  if (n === 0) {
-    return weights;
-  }
-
-  // Clean negative stakes
-  const cleanedStakes = stakes.map((s) => (s > 0 ? s : 0));
-
-  let totalStake = cleanedStakes.reduce((sum, s) => sum + s, 0);
-  if (totalStake <= 0) {
-    return weights;
-  }
-
-  const positiveCount = cleanedStakes.filter((s) => s > 0).length;
-  if (positiveCount === 0) {
-    return weights;
-  }
-
-  // If there are too few validators, don't cap; just normalize.
-  if (minCountForCap && positiveCount < minCountForCap) {
-    for (let i = 0; i < n; i++) {
-      if (cleanedStakes[i] > 0) {
-        weights[i] = cleanedStakes[i] / totalStake;
-      }
-    }
-    return weights;
-  }
-
-  let remainingIndices = [];
-  for (let i = 0; i < n; i++) {
-    if (cleanedStakes[i] > 0) {
-      remainingIndices.push(i);
-    }
-  }
-
-  let remainingStake = remainingIndices.reduce(
-    (sum, idx) => sum + cleanedStakes[idx],
-    0
-  );
-  let remainingBudget = 1.0;
-
-  const EPS = 1e-12;
-
-  while (
-    remainingIndices.length > 0 &&
-    remainingStake > EPS &&
-    remainingBudget > EPS
-  ) {
-    const provisional = {};
-    const overCap = [];
-
-    // Proportional allocation of remaining budget
-    for (const idx of remainingIndices) {
-      const w = (remainingBudget * cleanedStakes[idx]) / remainingStake;
-      provisional[idx] = w;
-      if (w > cap + EPS) {
-        overCap.push(idx);
-      }
-    }
-
-    if (overCap.length === 0) {
-      // Nobody exceeds the cap -> finalize
-      for (const idx of remainingIndices) {
-        weights[idx] = provisional[idx];
-      }
-      remainingBudget = 0;
-      break;
-    }
-
-    // Cap all oversubscribed validators at "cap"
-    let cappedStake = 0;
-    for (const idx of overCap) {
-      weights[idx] = cap;
-      remainingBudget -= cap;
-      cappedStake += cleanedStakes[idx];
-    }
-
-    // Remove them from the remaining set
-    remainingIndices = remainingIndices.filter(
-      (idx) => overCap.indexOf(idx) === -1
-    );
-    remainingStake -= cappedStake;
-
-    if (remainingBudget <= EPS || remainingStake <= EPS) {
-      break;
-    }
-  }
-
-  // If we still have positive stake and budget (should be rare), allocate proportionally
-  if (remainingIndices.length > 0 && remainingBudget > EPS && remainingStake > EPS) {
-    for (const idx of remainingIndices) {
-      weights[idx] = (remainingBudget * cleanedStakes[idx]) / remainingStake;
-    }
-  }
-
-  // Optional: small normalization to sum to 1 (when totalStake > 0)
-  const sumW = weights.reduce((sum, w) => sum + w, 0);
-  if (sumW > EPS) {
-    const factor = 1.0 / sumW;
-    for (let i = 0; i < n; i++) {
-      weights[i] *= factor;
-    }
-  }
-
-  return weights;
-}
-
-// -----------------------------------------------------------------------------
 // Formatting helpers
 // -----------------------------------------------------------------------------
 
@@ -1288,7 +1251,9 @@ function trimSheetToData(sheet, lastRow, lastColumn) {
 
   if (maxRows > minRowsToKeep) {
     const rowsToDelete = maxRows - minRowsToKeep;
-    sheet.deleteRows(minRowsToKeep + 1, rowsToDelete);
+    if (rowsToDelete > 0) {
+      sheet.deleteRows(minRowsToKeep + 1, rowsToDelete);
+    }
   }
 
   // Trim columns
