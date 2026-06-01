@@ -78,3 +78,20 @@ n8n-local.db
 .parcel-cache/
 .eslintcache
 .terser-cache
+
+# Governance proposal drafts (kept out of the public methodology repo)
+PROPOSAL-*.md
+
+# AI / assistant artifacts
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.claudeignore
+.codex/
+AGENTS.md
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+*.ai.md
+ai-notes/

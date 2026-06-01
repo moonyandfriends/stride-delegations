@@ -16,6 +16,15 @@ const FLAGSHIP_CHAIN_IDS = [
   'dydx-mainnet-1',   // dYdX
 ];
 
+// Host zones to exclude from the spreadsheet entirely (no sheet created),
+// even if Stride still returns them from the host_zone endpoint.
+const EXCLUDED_CHAIN_IDS = [
+  'umee-1',         // Umee / UX
+  'stargaze-1',     // Stargaze
+  'comdex-1',       // Comdex
+  'evmos_9001-2',   // Evmos
+];
+
 // For auto-filling uptime + governance with VLOOKUP
 const FLAGSHIP_UPTIME_SHEET_BY_CHAIN_ID = {
   'cosmoshub-4': 'cosmos-uptime+governance',
@@ -29,8 +38,6 @@ const CHAIN_ID_TO_NETWORK = {
   'cosmoshub-4': 'cosmoshub',
   'celestia': 'celestia',
   'dydx-mainnet-1': 'dydx',
-  'comdex-1': 'comdex',
-  'evmos_9001-2': 'evmos',
   'injective-1': 'injective',
   'haqq_11235-1': 'haqq',
   'juno-1': 'juno',
@@ -45,10 +52,35 @@ const CHAIN_ID_TO_NETWORK = {
   // Saga  support both possible chain IDs
   'saga-1': 'saga',
   'ssc-1': 'saga',
-
-  'stargaze-1': 'stargaze',
-  'umee-1': 'umee',
 };
+
+// -----------------------------------------------------------------------------
+// Stride "proof-of-authority" partner validators
+// -----------------------------------------------------------------------------
+//
+// These are operators in Stride's own validator set on other chains. We support
+// them by always delegating to them on the chains we stake to. A validator whose
+// moniker matches one of these (case-insensitive substring) is force-included as
+// eligible regardless of commission, stake rank, governance, or uptime checks.
+//
+// The only criterion still enforced is BONDED status: you cannot meaningfully
+// delegate to an unbonded/jailed validator.
+//
+// Patterns are intentionally short substrings to survive moniker variations across
+// chains (e.g. "Lavender.Five", "Lavender.Five Nodes 🍀"; "Imperator.co";
+// "Polkachu.com"; "Solva" / "CryptoCrew"). Keep them specific enough to avoid
+// matching unrelated monikers.
+const POA_PARTNER_PATTERNS = [
+  'cosmostation',
+  'keplr',
+  'imperator',
+  'stakecito',
+  'polkachu',
+  'lavender.five',
+  'lavenderfive',
+  'cryptocrew',  // Solva was formerly branded CryptoCrew
+  'solva',
+];
 
 // Column indices (1-based)
 const COL_NAME            = 1;  // A: Validator Name
@@ -244,6 +276,16 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
     const sheetName = sanitizeSheetName(rawName);
     const isFlagship = FLAGSHIP_CHAIN_IDS.indexOf(chainId) !== -1;
 
+    // Skip excluded host zones entirely. Remove any stale sheet left from a
+    // previous refresh, then move on without creating a new one.
+    if (EXCLUDED_CHAIN_IDS.indexOf(chainId) !== -1) {
+      const stale = ss.getSheetByName(sheetName);
+      if (stale) {
+        ss.deleteSheet(stale);
+      }
+      return;
+    }
+
     // Delete old sheet if it exists
     const existing = ss.getSheetByName(sheetName);
     if (existing) {
@@ -353,37 +395,46 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
 
       r.universalEligible = universalEligible;
       r.reasons = reasons; // may be empty
+
+      // Stride PoA partners are always included as long as they are bonded,
+      // regardless of commission / stake rank / (gov + uptime on flagship).
+      r.forceInclude = r.isPoaPartner && r.status === BONDED_STATUS;
+
       r.finalEligible = false; // filled below for non-flagship
     });
 
     // --- 32-validator global cap (non-flagship only at this stage) ---
+    //
+    // Forced PoA partners always occupy a slot. They count *within* the 32, so
+    // the remaining slots are filled by the top regular-eligible validators by
+    // stake (Delegations Minus Stride).
 
     if (!isFlagship) {
-      const baseEligible = rows.filter((r) => r.universalEligible);
-      if (baseEligible.length > 0) {
-        if (baseEligible.length > 32) {
-          baseEligible.sort((a, b) => b.deltaNoStride - a.deltaNoStride);
-          const allowedSet = new Set(
-            baseEligible.slice(0, 32).map((r) => r.address)
-          );
+      const forced = rows.filter((r) => r.forceInclude);
+      const slotsForRegular = Math.max(0, 32 - forced.length);
 
-          rows.forEach((r) => {
-            if (r.universalEligible && allowedSet.has(r.address)) {
-              r.finalEligible = true;
-            } else if (r.universalEligible && !allowedSet.has(r.address)) {
-              r.finalEligible = false;
-              r.reasons.push('over_32_cap');
-            } else {
-              r.finalEligible = false;
-            }
-          });
+      const regularEligible = rows.filter(
+        (r) => r.universalEligible && !r.forceInclude
+      );
+      regularEligible.sort((a, b) => b.deltaNoStride - a.deltaNoStride);
+
+      const allowedRegular = new Set(
+        regularEligible.slice(0, slotsForRegular).map((r) => r.address)
+      );
+
+      rows.forEach((r) => {
+        if (r.forceInclude) {
+          r.finalEligible = true;
+          r.reasons = []; // force-included; clear any ineligibility reasons
+        } else if (r.universalEligible && allowedRegular.has(r.address)) {
+          r.finalEligible = true;
+        } else if (r.universalEligible) {
+          r.finalEligible = false;
+          r.reasons.push('over_32_cap');
         } else {
-          //  32: finalEligible = universalEligible
-          rows.forEach((r) => {
-            r.finalEligible = r.universalEligible;
-          });
+          r.finalEligible = false;
         }
-      }
+      });
     }
 
     // Sort ALL validators by Delegations Minus Stride (largest first)
@@ -474,16 +525,24 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
       if (isFlagship) {
         // Universal-only information; final eligibility will be filled via menu
         eligibilityValues = rows.map(() => ['']);
-        reasonValues = rows.map((r) => [
-          r.universalEligible
-            ? 'universal_OK (run flagship eligibility tool)'
-            : (r.reasons.join(', ') || 'ineligible_unknown'),
-        ]);
+        reasonValues = rows.map((r) => {
+          if (r.forceInclude) {
+            return ['force_included (PoA partner) — run flagship eligibility tool'];
+          }
+          return [
+            r.universalEligible
+              ? 'universal_OK (run flagship eligibility tool)'
+              : (r.reasons.join(', ') || 'ineligible_unknown'),
+          ];
+        });
       } else {
         eligibilityValues = rows.map((r) => [r.finalEligible ? 'Y' : 'N']);
-        reasonValues = rows.map((r) => [
-          r.finalEligible ? 'OK' : (r.reasons.join(', ') || 'ineligible_unknown'),
-        ]);
+        reasonValues = rows.map((r) => {
+          if (r.forceInclude) return ['force_included (PoA partner)'];
+          return [
+            r.finalEligible ? 'OK' : (r.reasons.join(', ') || 'ineligible_unknown'),
+          ];
+        });
       }
 
       sheet.getRange(2, COL_ELIG, numRows, 1).setValues(eligibilityValues);
@@ -651,6 +710,7 @@ function applyFlagshipEligibilityForActiveSheet() {
     return idx + 1; // 1-based
   }
 
+  const colName          = findCol('Validator Name');
   const colAddr          = findCol('Validator Address');
   const colDelta         = findCol('Delegations Minus Stride');
   const colCommission    = findCol('Commission');
@@ -665,6 +725,7 @@ function applyFlagshipEligibilityForActiveSheet() {
   const colNewWeight     = findCol('New Weight');
 
   // --- Read data ranges ---
+  const nameValues   = sheet.getRange(2, colName, numRows, 1).getValues();
   const addrValues   = sheet.getRange(2, colAddr, numRows, 1).getValues();
   const deltaValues  = sheet.getRange(2, colDelta, numRows, 1).getValues();
   const commValues   = sheet.getRange(2, colCommission, numRows, 1).getValues();
@@ -759,6 +820,7 @@ function applyFlagshipEligibilityForActiveSheet() {
   // --- Build row objects from sheet data ---
   const rows = [];
   for (let i = 0; i < numRows; i++) {
+    const name = String(nameValues[i][0] || '').trim();
     const addr = String(addrValues[i][0] || '').trim();
 
     // Delegations Minus Stride (stake excluding Stride)
@@ -788,8 +850,11 @@ function applyFlagshipEligibilityForActiveSheet() {
     const uptime = parsePercentOrFraction(uptimeValues[i][0]);
     const govFraction = parseGovFraction(govValues[i][0], isCelestia);
 
+    const isPoaPartner = isPoaPartnerMoniker(name);
+
     rows.push({
       sheetRowIndex: i + 2,
+      name,
       addr,
       tokens,
       strideDelegationNum,
@@ -798,6 +863,10 @@ function applyFlagshipEligibilityForActiveSheet() {
       isActive,
       uptime,
       govFraction,
+      isPoaPartner,
+      // Force-included if a bonded PoA partner (bypasses commission / stake rank /
+      // gov / uptime; bonded status is still required).
+      forceInclude: isPoaPartner && isActive,
       universalEligible: false,
       passesUptime: false,
       passesGov: false,
@@ -894,33 +963,42 @@ function applyFlagshipEligibilityForActiveSheet() {
     r.universalEligible = universalEligible;
     r.passesUptime = passesUptime;
     r.passesGov = passesGov;
-    r.baseEligible = universalEligible && passesUptime && passesGov;
-    r.reasons = reasons;
+
+    if (r.forceInclude) {
+      // Bonded PoA partner: always base-eligible, ineligibility reasons cleared.
+      r.baseEligible = true;
+      r.reasons = [];
+    } else {
+      r.baseEligible = universalEligible && passesUptime && passesGov;
+      r.reasons = reasons;
+    }
   }
 
   // --- Second pass: 32-validator global cap among baseEligible ---
+  //
+  // Forced PoA partners always occupy a slot and count *within* the 32. The
+  // remaining slots are filled by the top regular base-eligible validators by
+  // stake (Delegations Minus Stride).
 
-  const baseEligibleRows = rows.filter((r) => r.baseEligible);
-  if (baseEligibleRows.length > 0) {
-    // Sort by tokens (Delegations Minus Stride) descending
-    baseEligibleRows.sort((a, b) => b.tokens - a.tokens);
+  const forced = rows.filter((r) => r.forceInclude);
+  const slotsForRegular = Math.max(0, 32 - forced.length);
 
-    const allowed = baseEligibleRows.slice(0, 32).map((r) => r.addr);
-    const allowedSet = new Set(allowed);
+  const regularBaseRows = rows.filter((r) => r.baseEligible && !r.forceInclude);
+  regularBaseRows.sort((a, b) => b.tokens - a.tokens);
 
-    for (const r of rows) {
-      if (r.baseEligible && allowedSet.has(r.addr)) {
-        r.finalEligible = true;
-      } else if (r.baseEligible && !allowedSet.has(r.addr)) {
-        r.finalEligible = false;
-        r.reasons.push('over_32_cap');
-      } else {
-        r.finalEligible = false;
-      }
-    }
-  } else {
-    // Nobody passes base criteria
-    for (const r of rows) {
+  const allowedSet = new Set(
+    regularBaseRows.slice(0, slotsForRegular).map((r) => r.addr)
+  );
+
+  for (const r of rows) {
+    if (r.forceInclude) {
+      r.finalEligible = true;
+    } else if (r.baseEligible && allowedSet.has(r.addr)) {
+      r.finalEligible = true;
+    } else if (r.baseEligible) {
+      r.finalEligible = false;
+      r.reasons.push('over_32_cap');
+    } else {
       r.finalEligible = false;
     }
   }
@@ -979,7 +1057,7 @@ function applyFlagshipEligibilityForActiveSheet() {
     if (r.finalEligible) {
       eligibleCount++;
       newEligValues.push(['Y']);
-      reasonValues.push(['OK']);
+      reasonValues.push([r.forceInclude ? 'force_included (PoA partner)' : 'OK']);
     } else {
       newEligValues.push(['N']);
       reasonValues.push([r.reasons.join(', ') || 'ineligible_unknown']);
@@ -1084,6 +1162,16 @@ function isCexMoniker(name) {
   return patterns.some((p) => s.indexOf(p.toLowerCase()) !== -1);
 }
 
+/**
+ * True if the moniker belongs to one of Stride's proof-of-authority partner
+ * validators (see POA_PARTNER_PATTERNS). Case-insensitive substring match.
+ */
+function isPoaPartnerMoniker(name) {
+  if (!name) return false;
+  const s = String(name).toLowerCase();
+  return POA_PARTNER_PATTERNS.some((p) => s.indexOf(p) !== -1);
+}
+
 // -----------------------------------------------------------------------------
 // Merge Stride + live validator sets
 // -----------------------------------------------------------------------------
@@ -1154,6 +1242,7 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
     }
 
     const isCex = isCexMoniker(moniker);
+    const isPoaPartner = isPoaPartnerMoniker(moniker);
 
     rows.push({
       name: moniker,
@@ -1165,8 +1254,10 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
       deltaNoStride,
       status,
       isCex,
+      isPoaPartner,
       commissionRate,
       universalEligible: false,
+      forceInclude: false,
       finalEligible: false,
       reasons: [],
     });
@@ -1192,6 +1283,7 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
     const status = ''; // no live info
 
     const isCex = isCexMoniker(moniker);
+    const isPoaPartner = isPoaPartnerMoniker(moniker);
 
     rows.push({
       name: moniker,
@@ -1203,8 +1295,10 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
       deltaNoStride,
       status,
       isCex,
+      isPoaPartner,
       commissionRate: null,
       universalEligible: false,
+      forceInclude: false,
       finalEligible: false,
       reasons: [],
     });
