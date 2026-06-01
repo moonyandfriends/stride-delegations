@@ -102,6 +102,7 @@ const EXCLUDED_NAME_PATTERNS = [
   'deprecating',
   'depreciating',
   'inactive',
+  'deactivated',
 ];
 
 // Column indices (1-based)
