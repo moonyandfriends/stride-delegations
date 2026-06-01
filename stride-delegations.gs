@@ -82,6 +82,28 @@ const POA_PARTNER_PATTERNS = [
   'solva',
 ];
 
+// Validators whose moniker signals they are winding down or do not want
+// delegations are excluded outright. Matched as case-insensitive substrings
+// (whitespace collapsed) anywhere in the moniker. This exclusion takes
+// precedence over PoA-partner force-inclusion: a partner that is shutting down
+// a validator on a given chain should not receive a forced delegation.
+const EXCLUDED_NAME_PATTERNS = [
+  'redelegate',
+  're-delegate',
+  'undelegate',
+  'do not delegate',
+  'closing',
+  'shut down',
+  'shutdown',
+  'shutting down',
+  'sunsetting',
+  'decommissioned',
+  'discontinued',
+  'deprecating',
+  'depreciating',
+  'inactive',
+];
+
 // Column indices (1-based)
 const COL_NAME            = 1;  // A: Validator Name
 const COL_ADDRESS         = 2;  // B: Validator Address
@@ -393,12 +415,19 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
         reasons.push('top_N_stake');
       }
 
+      if (r.nameExclusion) {
+        universalEligible = false;
+        reasons.push('name_excluded (' + r.nameExclusion + ')');
+      }
+
       r.universalEligible = universalEligible;
       r.reasons = reasons; // may be empty
 
       // Stride PoA partners are always included as long as they are bonded,
       // regardless of commission / stake rank / (gov + uptime on flagship).
-      r.forceInclude = r.isPoaPartner && r.status === BONDED_STATUS;
+      // A "winding down / do not delegate" moniker overrides force-inclusion.
+      r.forceInclude =
+        r.isPoaPartner && r.status === BONDED_STATUS && !r.nameExclusion;
 
       r.finalEligible = false; // filled below for non-flagship
     });
@@ -851,6 +880,7 @@ function applyFlagshipEligibilityForActiveSheet() {
     const govFraction = parseGovFraction(govValues[i][0], isCelestia);
 
     const isPoaPartner = isPoaPartnerMoniker(name);
+    const nameExclusion = excludedNameMatch(name);
 
     rows.push({
       sheetRowIndex: i + 2,
@@ -864,9 +894,11 @@ function applyFlagshipEligibilityForActiveSheet() {
       uptime,
       govFraction,
       isPoaPartner,
+      nameExclusion,
       // Force-included if a bonded PoA partner (bypasses commission / stake rank /
-      // gov / uptime; bonded status is still required).
-      forceInclude: isPoaPartner && isActive,
+      // gov / uptime; bonded status is still required). A "winding down / do not
+      // delegate" moniker overrides force-inclusion.
+      forceInclude: isPoaPartner && isActive && !nameExclusion,
       universalEligible: false,
       passesUptime: false,
       passesGov: false,
@@ -942,6 +974,11 @@ function applyFlagshipEligibilityForActiveSheet() {
     if (topSet.has(r.addr)) {
       universalEligible = false;
       reasons.push('top_N_stake');
+    }
+
+    if (r.nameExclusion) {
+      universalEligible = false;
+      reasons.push('name_excluded (' + r.nameExclusion + ')');
     }
 
     const passesUptime = r.uptime >= 0.95;
@@ -1172,6 +1209,23 @@ function isPoaPartnerMoniker(name) {
   return POA_PARTNER_PATTERNS.some((p) => s.indexOf(p) !== -1);
 }
 
+/**
+ * If the moniker contains a "winding down / do not delegate" signal
+ * (see EXCLUDED_NAME_PATTERNS), returns the matched pattern; otherwise null.
+ * Case-insensitive; collapses runs of whitespace so e.g. "shutting   down"
+ * still matches "shutting down".
+ */
+function excludedNameMatch(name) {
+  if (!name) return null;
+  const s = String(name).toLowerCase().replace(/\s+/g, ' ');
+  for (let i = 0; i < EXCLUDED_NAME_PATTERNS.length; i++) {
+    if (s.indexOf(EXCLUDED_NAME_PATTERNS[i]) !== -1) {
+      return EXCLUDED_NAME_PATTERNS[i];
+    }
+  }
+  return null;
+}
+
 // -----------------------------------------------------------------------------
 // Merge Stride + live validator sets
 // -----------------------------------------------------------------------------
@@ -1243,6 +1297,7 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
 
     const isCex = isCexMoniker(moniker);
     const isPoaPartner = isPoaPartnerMoniker(moniker);
+    const nameExclusion = excludedNameMatch(moniker);
 
     rows.push({
       name: moniker,
@@ -1255,6 +1310,7 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
       status,
       isCex,
       isPoaPartner,
+      nameExclusion,
       commissionRate,
       universalEligible: false,
       forceInclude: false,
@@ -1284,6 +1340,7 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
 
     const isCex = isCexMoniker(moniker);
     const isPoaPartner = isPoaPartnerMoniker(moniker);
+    const nameExclusion = excludedNameMatch(moniker);
 
     rows.push({
       name: moniker,
@@ -1296,6 +1353,7 @@ function buildMergedValidatorRows(strideValidators, liveValidators) {
       status,
       isCex,
       isPoaPartner,
+      nameExclusion,
       commissionRate: null,
       universalEligible: false,
       forceInclude: false,
