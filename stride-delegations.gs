@@ -105,6 +105,20 @@ const EXCLUDED_NAME_PATTERNS = [
   'deactivated',
 ];
 
+// Per-chain maximum commission (decimal). Celestia raised its protocol-minimum
+// commission to 20%, so validators there are allowed up to 20% (validators with
+// strictly more than 20% are excluded; exactly 20% stays eligible). All other
+// chains keep the 10% cap.
+const DEFAULT_MAX_COMMISSION = 0.10;
+const MAX_COMMISSION_BY_CHAIN_ID = {
+  'celestia': 0.20,
+};
+
+function maxCommissionForChainId(chainId) {
+  const cap = MAX_COMMISSION_BY_CHAIN_ID[chainId];
+  return cap != null ? cap : DEFAULT_MAX_COMMISSION;
+}
+
 // Column indices (1-based)
 const COL_NAME            = 1;  // A: Validator Name
 const COL_ADDRESS         = 2;  // B: Validator Address
@@ -298,6 +312,7 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
     const rawName = chainId || hz.host_denom || 'host_zone';
     const sheetName = sanitizeSheetName(rawName);
     const isFlagship = FLAGSHIP_CHAIN_IDS.indexOf(chainId) !== -1;
+    const maxCommission = maxCommissionForChainId(chainId);
 
     // Skip excluded host zones entirely. Remove any stale sheet left from a
     // previous refresh, then move on without creating a new one.
@@ -401,9 +416,9 @@ function createStrideSheetsWithLiveData(ss, hostZones) {
       if (r.commissionRate == null || isNaN(r.commissionRate)) {
         universalEligible = false;
         reasons.push('no_commission');
-      } else if (r.commissionRate > 0.10) {
+      } else if (r.commissionRate > maxCommission + 1e-9) {
         universalEligible = false;
-        reasons.push('commission>10%');
+        reasons.push('commission>' + Math.round(maxCommission * 100) + '%');
       }
 
       if (bottomSet.has(r.address)) {
@@ -846,6 +861,7 @@ function applyFlagshipEligibilityForActiveSheet() {
 
   const isCelestia = sheetName === 'celestia';
   const requiredGovFraction = isCelestia ? 2 / 5 : 5 / 10; // 0.4 or 0.5
+  const maxCommission = maxCommissionForChainId(sheetName);
 
   // --- Build row objects from sheet data ---
   const rows = [];
@@ -963,9 +979,9 @@ function applyFlagshipEligibilityForActiveSheet() {
     if (r.commissionRate == null || isNaN(r.commissionRate)) {
       universalEligible = false;
       reasons.push('no_commission');
-    } else if (r.commissionRate > 0.10) {
+    } else if (r.commissionRate > maxCommission + 1e-9) {
       universalEligible = false;
-      reasons.push('commission>10%');
+      reasons.push('commission>' + Math.round(maxCommission * 100) + '%');
     }
 
     if (bottomSet.has(r.addr)) {
