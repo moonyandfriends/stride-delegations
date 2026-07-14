@@ -71,7 +71,6 @@ const CHAIN_ID_TO_NETWORK = {
 // "Polkachu.com"; "Solva" / "CryptoCrew"). Keep them specific enough to avoid
 // matching unrelated monikers.
 const POA_PARTNER_PATTERNS = [
-  'cosmostation',
   'keplr',
   'imperator',
   'stakecito',
@@ -83,11 +82,16 @@ const POA_PARTNER_PATTERNS = [
 ];
 
 // Validators whose moniker signals they are winding down or do not want
-// delegations are excluded outright. Matched as case-insensitive substrings
+// delegations are excluded outright, along with specific operators Stride has
+// chosen not to delegate to. Matched as case-insensitive substrings
 // (whitespace collapsed) anywhere in the moniker. This exclusion takes
 // precedence over PoA-partner force-inclusion: a partner that is shutting down
 // a validator on a given chain should not receive a forced delegation.
 const EXCLUDED_NAME_PATTERNS = [
+  'cosmostation',
+  'citadel.one',
+  'citadelone',
+  'citadel1',
   'redelegate',
   're-delegate',
   'undelegate',
